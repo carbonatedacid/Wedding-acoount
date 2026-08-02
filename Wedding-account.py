@@ -21,24 +21,48 @@ def get_data(ticker):
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.get_level_values(0)
             
-        df = df[['Close', 'Volume']].copy()
+        df = df[['Close', 'High', 'Low', 'Volume']].copy()
+        
         df["Close"] = pd.to_numeric(df["Close"], errors='coerce')
+        df["High"] = pd.to_numeric(df["High"], errors='coerce')
+        df["Low"] = pd.to_numeric(df["Low"], errors='coerce')
         df["Volume"] = pd.to_numeric(df["Volume"], errors='coerce')
         
+        # 기본 이동평균선 및 지수이동평균선
         df["MA120"] = df["Close"].rolling(window=120).mean()
         df["MA240"] = df["Close"].rolling(window=240).mean()
         df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
         
+        # VWAP 계산
         cum_vol = df["Volume"].cumsum()
         df["VWAP"] = (df["Volume"] * df["Close"]).cumsum() / cum_vol.replace(0, 1)
         
+        # RSI 계산
         delta = df["Close"].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = -delta.where(delta < 0, 0).rolling(14).mean()
-        
         loss = loss.replace(0, 0.000001)
         rs = gain / loss
         df["RSI"] = 100 - (100 / (1 + rs))
+        
+        # 일목균형표 구름대 (Senkou Span A, Senkou Span B) 계산
+        # 전환선 (9일 고가 + 9일 저가) / 2
+        nine_high = df["High"].rolling(window=9).max()
+        nine_low = df["Low"].rolling(window=9).min()
+        df["Conversion_Line"] = (nine_high + nine_low) / 2
+        
+        # 기준선 (26일 고가 + 26일 저가) / 2
+        twenty_six_high = df["High"].rolling(window=26).max()
+        twenty_six_low = df["Low"].rolling(window=26).min()
+        df["Base_Line"] = (twenty_six_high + twenty_six_low) / 2
+        
+        # 선행스팬 A (전환선 + 기준선) / 2 (현재 시점에 맞추기 위해 shift 없이 정렬)
+        df["Senkou_Span_A"] = (df["Conversion_Line"] + df["Base_Line"]) / 2
+        
+        # 선행스팬 B (52일 고가 + 52일 저가) / 2
+        fifty_two_high = df["High"].rolling(window=52).max()
+        fifty_two_low = df["Low"].rolling(window=52).min()
+        df["Senkou_Span_B"] = (fifty_two_high + fifty_two_low) / 2
         
         return df.dropna()
     except Exception as e:
@@ -87,13 +111,15 @@ def send_report():
         if df is None or df.empty: 
             continue
         
-        # [차트 1] 최근 1개월(30일) 단기 줌인 차트
+        # [차트 1] 최근 1개월(30일) 단기 줌인 차트 + 구름대 포함
         recent_1m = df.iloc[-30:]
         fig1 = plt.figure(figsize=(10, 6))
         plt.plot(recent_1m.index, recent_1m['Close'], color='black', label='Price (1M)')
         plt.plot(recent_1m.index, recent_1m['MA120'], color='blue', linestyle='--', label='MA120')
         plt.plot(recent_1m.index, recent_1m['EMA9'], color='orange', label='EMA9')
-        plt.title(f"{t} - Recent 1-Month Trend")
+        plt.fill_between(recent_1m.index, recent_1m['Senkou_Span_A'], recent_1m['Senkou_Span_B'], 
+                         color='lightgreen', alpha=0.3, label='Cloud (Senkou A/B)')
+        plt.title(f"{t} - Recent 1-Month Trend with Cloud")
         plt.legend()
         plt.tight_layout()
         
@@ -122,13 +148,15 @@ def send_report():
                       data={"chat_id": CHAT_ID}, files={"photo": ("c2.png", buf2)})
         buf2.close()
 
-        # [차트 3] 180일(약 6개월) 확대 차트 (웅덩이 이격 판정용)
+        # [차트 3] 180일(약 6개월) 확대 차트 (웅덩이 이격 판정용) + 구름대 포함
         recent_180d = df.iloc[-180:]
         fig3 = plt.figure(figsize=(10, 6))
         plt.plot(recent_180d.index, recent_180d['Close'], color='black', label='Price (180D)')
         plt.plot(recent_180d.index, recent_180d['MA120'], color='blue', label='MA120')
         plt.plot(recent_180d.index, recent_180d['MA240'], color='red', label='MA240')
-        plt.title(f"{t} - 180-Day Zoom (Entry Point)")
+        plt.fill_between(recent_180d.index, recent_180d['Senkou_Span_A'], recent_180d['Senkou_Span_B'], 
+                         color='lightgreen', alpha=0.3, label='Cloud (Senkou A/B)')
+        plt.title(f"{t} - 180-Day Zoom with Cloud (Entry Point)")
         plt.legend()
         plt.tight_layout()
         
