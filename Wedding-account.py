@@ -89,25 +89,48 @@ def get_action_msg(last):
         if p <= ma120 * 1.1: return "💧 매수(1단계): 120일선 근접"
     return "🌿 관망"
 
+# [추가] 텔레그램 전송 공용 함수: 실패 시 최대 3회 재시도, 응답 상태 체크
+def send_telegram(method, **kwargs):
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+                timeout=15, **kwargs
+            )
+            if r.ok:
+                return r
+            print(f"[Telegram Error] {method} status={r.status_code} body={r.text}")
+        except requests.RequestException as e:
+            print(f"[Telegram Request Failed] {method} attempt={attempt+1} err={e}")
+    return None
+
 def send_report():
+    # [수정] get_data를 티커별로 한 번만 호출해서 캐싱 (기존엔 리포트용/차트용으로 두 번 호출됨)
+    data_cache = {t: get_data(t) for t in TICKERS}
     vix_df = get_data("^VIX")
+
+    failed_tickers = [t for t, df in data_cache.items() if df is None or df.empty]
+
     vix_val = vix_df["Close"].iloc[-1] if vix_df is not None and not vix_df.empty else 0
     
     report = f"🚀 **[Seulgi 투자 비서 최종 보고서]**\n📊 VIX 지수: {vix_val:.2f}\n\n종목 | 추세 | RSI | 상세 판단\n---|---|---|---\n"
     
     for t in TICKERS:
-        df = get_data(t)
+        df = data_cache[t]
         if df is None or df.empty: 
             continue
         last = df.iloc[-1]
         report += f"{t} | {get_trend_msg(last)} | {last['RSI']:.1f} | {get_action_msg(last)}\n"
+
+    # [추가] 데이터 못 받아온 티커가 있으면 리포트 하단에 명시 (조용히 누락되는 것 방지)
+    if failed_tickers:
+        report += f"\n⚠️ 데이터 조회 실패: {', '.join(failed_tickers)}"
     
     # 텔레그램 텍스트 리포트 전송
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                  data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
+    send_telegram("sendMessage", data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
 
     for t in TICKERS:
-        df = get_data(t)
+        df = data_cache[t]
         if df is None or df.empty: 
             continue
         
@@ -127,8 +150,7 @@ def send_report():
         plt.savefig(buf1, format='png')
         buf1.seek(0)
         plt.close(fig1)
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", 
-                      data={"chat_id": CHAT_ID}, files={"photo": ("c1.png", buf1)})
+        send_telegram("sendPhoto", data={"chat_id": CHAT_ID}, files={"photo": ("c1.png", buf1)})
         buf1.close()
 
         # [차트 2] 기존 3년치 전체 통합 차트
@@ -144,8 +166,7 @@ def send_report():
         plt.savefig(buf2, format='png')
         buf2.seek(0)
         plt.close(fig2)
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", 
-                      data={"chat_id": CHAT_ID}, files={"photo": ("c2.png", buf2)})
+        send_telegram("sendPhoto", data={"chat_id": CHAT_ID}, files={"photo": ("c2.png", buf2)})
         buf2.close()
 
         # [차트 3] 180일(약 6개월) 확대 차트 (웅덩이 이격 판정용) + 구름대 포함
@@ -164,8 +185,7 @@ def send_report():
         plt.savefig(buf3, format='png')
         buf3.seek(0)
         plt.close(fig3)
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", 
-                      data={"chat_id": CHAT_ID}, files={"photo": ("c3.png", buf3)})
+        send_telegram("sendPhoto", data={"chat_id": CHAT_ID}, files={"photo": ("c3.png", buf3)})
         buf3.close()
 
 if __name__ == "__main__":
