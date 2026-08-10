@@ -1,299 +1,33 @@
-import io
-import os
-import xml.etree.ElementTree as ET
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import pandas as pd
-import requests
-import yfinance as yf
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8881687625:AAHHN6kxCOFPhlIqTYpWBuK0HPAIyx-dlTY")
-CHAT_ID = os.getenv("CHAT_ID", "6129768085")
-
-TICKERS = ["QQQ", "QLD", "SPY", "BTC-USD", "SOXL"]
-
-def get_data(ticker):
-    try:
-        df = yf.download(ticker, period="3y", progress=False, multi_level_index=False)
-        if df is None or df.empty:
-            return None
-            
-        if isinstance(df.columns, pd.MultiIndex): 
-            df.columns = df.columns.get_level_values(0)
-            
-        df = df[['Close', 'High', 'Low', 'Volume']].copy()
-        
-        df["Close"] = pd.to_numeric(df["Close"], errors='coerce')
-        df["High"] = pd.to_numeric(df["High"], errors='coerce')
-        df["Low"] = pd.to_numeric(df["Low"], errors='coerce')
-        df["Volume"] = pd.to_numeric(df["Volume"], errors='coerce')
-        
-        # 기본 이동평균선 및 지수이동평균선
-        df["MA120"] = df["Close"].rolling(window=120).mean()
-        df["MA240"] = df["Close"].rolling(window=240).mean()
-        df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
-        
-        # [수정] VWAP: 3년 전체 누적방식은 시간이 지날수록 사실상 MA240과 다름없어져 무의미해짐.
-        # 최근 20거래일(약 1개월) 롤링 VWAP으로 변경해 실질적인 단기 매물대 기준으로 사용.
-        VWAP_WINDOW = 20
-        rolling_vol = df["Volume"].rolling(window=VWAP_WINDOW).sum()
-        df["VWAP"] = (df["Volume"] * df["Close"]).rolling(window=VWAP_WINDOW).sum() / rolling_vol.replace(0, 1)
-        
-        # [수정] RSI: 단순이동평균(Cutler's RSI) 대신 Wilder 방식(표준 RSI, TradingView 등과 동일)으로 변경
-        delta = df["Close"].diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        avg_loss = avg_loss.replace(0, 0.000001)
-        rs = avg_gain / avg_loss
-        df["RSI"] = 100 - (100 / (1 + rs))
-        
-        # 일목균형표 구름대 (Senkou Span A, Senkou Span B) 계산
-        # 전환선 (9일 고가 + 9일 저가) / 2
-        nine_high = df["High"].rolling(window=9).max()
-        nine_low = df["Low"].rolling(window=9).min()
-        df["Conversion_Line"] = (nine_high + nine_low) / 2
-        
-        # 기준선 (26일 고가 + 26일 저가) / 2
-        twenty_six_high = df["High"].rolling(window=26).max()
-        twenty_six_low = df["Low"].rolling(window=26).min()
-        df["Base_Line"] = (twenty_six_high + twenty_six_low) / 2
-        
-        # 52일 고가/저가 (선행스팬 B용)
-        fifty_two_high = df["High"].rolling(window=52).max()
-        fifty_two_low = df["Low"].rolling(window=52).min()
-        
-        # [수정] 선행스팬 A/B를 표준 일목균형표 방식대로 26일 "뒤(미래)"로 shift.
-        # 기존엔 shift 없이 당일에 그대로 붙여서 "선행"의 의미가 없었음.
-        df["Senkou_Span_A"] = ((df["Conversion_Line"] + df["Base_Line"]) / 2).shift(26)
-        df["Senkou_Span_B"] = ((fifty_two_high + fifty_two_low) / 2).shift(26)
-        
-        # [추가] MA240 기울기: 최근 20거래일 대비 MA240 변화량 → 장기추세 방향(상승/하락) 필터로 사용
-        df["MA240_Slope"] = df["MA240"].diff(20)
-        
-        # [추가] ATR(14, Wilder 방식) 및 ATR% (종가 대비 %로 정규화해 종목 간 변동성 비교 가능하게)
-        prev_close = df["Close"].shift(1)
-        true_range = pd.concat([
-            df["High"] - df["Low"],
-            (df["High"] - prev_close).abs(),
-            (df["Low"] - prev_close).abs()
-        ], axis=1).max(axis=1)
-        df["ATR"] = true_range.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        df["ATR_Pct"] = (df["ATR"] / df["Close"]) * 100
-        df["ATR_Pct_MA20"] = df["ATR_Pct"].rolling(window=20).mean()
-        
-        # [추가] 52주(약 252거래일) 고점 및 고점 대비 현재 위치(%)
-        df["High_52W"] = df["Close"].rolling(window=252, min_periods=1).max()
-        df["Pct_From_52W_High"] = (df["Close"] / df["High_52W"] - 1) * 100
-        
-        return df.dropna()
-    except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
-        return None
-
-def get_trend_msg(last):
-    # [추가] MA240 기울기 태그: 장기추세가 상승(🔼)/하락(🔽)/횡보(➖)인지 함께 표시
-    if last["MA240_Slope"] > 0:
-        slope_tag = "🔼"
-    elif last["MA240_Slope"] < 0:
-        slope_tag = "🔽"
-    else:
-        slope_tag = "➖"
+name: Daily Investment Report
+on:
+  schedule:
+    # 1. 한국 시간 아침 8시 정각 (계절 무관 항상 동일)
+    - cron: '0 23 * * *'
     
-    if last["Close"] > last["EMA9"] and last["EMA9"] > last["MA120"]: 
-        base = "📈상승"
-    elif last["Close"] < last["MA120"]: 
-        base = "📉하락"
-    else:
-        base = "➡️횡보"
+    # 2. 미국 증시 장 시작 시간 자동 대응
+    # 서머타임 기간 (3월 ~ 10월): 한국 시간 밤 10시 30분 (UTC 13:30)
+    - cron: '30 13 8-31 3 *'
+    - cron: '30 13 * 4-10 *'
+    - cron: '30 13 1-7 11 *'
     
-    # [추가] ATR%가 자기 자신의 최근 20일 평균 대비 1.5배 이상이면 변동성 급증 플래그
-    vola_tag = "⚡" if last["ATR_Pct"] >= last["ATR_Pct_MA20"] * 1.5 else ""
-    
-    return f"{base}(장기{slope_tag}){vola_tag}"
-
-def get_cross_msg(df, lookback=5):
-    # [추가] MA120 vs MA240 골든/데드크로스 여부 (최근 lookback일 내 교차 발생 시 우선 표시, 없으면 현재 배열 상태)
-    if len(df) < 2:
-        return "-"
-    diff = (df["MA120"] - df["MA240"]).iloc[-(lookback + 1):]
-    if len(diff) >= 2:
-        crossed = ((diff.shift(1) * diff) < 0).iloc[1:]
-        if crossed.any():
-            return "✨골든크로스" if diff.iloc[-1] > 0 else "💀데드크로스"
-    return "정배열(120>240)" if diff.iloc[-1] > 0 else "역배열(120<240)"
-
-def get_vix_regime(vix_val):
-    # [추가] VIX 구간 분류
-    if vix_val >= 30:
-        return "공포"
-    elif vix_val >= 20:
-        return "주의"
-    return "안정"
-
-def get_action_msg(last, vix_regime="안정"):
-    p, rsi, ma120 = last["Close"], last["RSI"], last["MA120"]
-    ma240_falling = last["MA240_Slope"] < 0
-    
-    if rsi >= 70: 
-        return "⚠️ 매도(과열): 분할 매도"
-    if p < last["EMA9"] and p < last["VWAP"]: 
-        return "📉 매도(이탈): EMA 9 하향 이탈"
-    
-    if rsi < 70:
-        # [추가] MA240 하락추세 + VIX 상태를 매수 신호에 함께 반영 (신호 자체는 유지하되 주의 문구로 필터링)
-        if ma240_falling and vix_regime == "공포":
-            suffix = " (장기추세 하락+VIX 공포: 진입 보류 권장)"
-        elif ma240_falling:
-            suffix = " (장기추세 하락 중: 비중 축소·신중 진입)"
-        elif vix_regime == "공포":
-            suffix = " (VIX 공포 구간: 분할 축소)"
-        elif vix_regime == "주의":
-            suffix = " (VIX 주의 구간)"
-        else:
-            suffix = ""
-        
-        if p < ma120 * 0.8: return f"🔥 매수(4단계): 심한 웅덩이{suffix}"
-        if p < ma120 * 0.9: return f"🔥 매수(3단계): 120일선 하향{suffix}"
-        if p <= ma120: return f"💰 매수(2단계): 120일선 터치{suffix}"
-        if p <= ma120 * 1.1: return f"💧 매수(1단계): 120일선 근접{suffix}"
-    return "🌿 관망"
-
-def get_economic_events():
-    # [추가] 이번 주 주요 경제지표(USD, High 영향) — ForexFactory 비공식 공개 피드 사용 (무료/키 불필요).
-    # 비공식 엔드포인트라 언제든 형식이 바뀌거나 응답이 끊길 수 있어, 실패해도 리포트 전체엔 영향 없게 예외처리.
-    try:
-        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.xml", timeout=10)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        events = []
-        for ev in root.findall("event"):
-            if ev.findtext("country", "").strip() != "USD":
-                continue
-            if ev.findtext("impact", "").strip() != "High":
-                continue
-            title = ev.findtext("title", "").strip()
-            date = ev.findtext("date", "").strip()
-            time_ = ev.findtext("time", "").strip()
-            events.append(f"{date} {time_} | {title}")
-        return events if events else None
-    except Exception as e:
-        print(f"[Economic Calendar Error] {e}")
-        return None
-
-# [추가] 텔레그램 전송 공용 함수: 실패 시 최대 3회 재시도, 응답 상태 체크
-def send_telegram(method, **kwargs):
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
-                timeout=15, **kwargs
-            )
-            if r.ok:
-                return r
-            print(f"[Telegram Error] {method} status={r.status_code} body={r.text}")
-        except requests.RequestException as e:
-            print(f"[Telegram Request Failed] {method} attempt={attempt+1} err={e}")
-    return None
-
-def send_report():
-    # [수정] get_data를 티커별로 한 번만 호출해서 캐싱 (기존엔 리포트용/차트용으로 두 번 호출됨)
-    data_cache = {t: get_data(t) for t in TICKERS}
-    vix_df = get_data("^VIX")
-
-    failed_tickers = [t for t, df in data_cache.items() if df is None or df.empty]
-
-    vix_val = vix_df["Close"].iloc[-1] if vix_df is not None and not vix_df.empty else 0
-    # [추가] VIX 구간을 헤더에 표시하고, 아래 종목별 판단 로직에도 실제로 반영
-    vix_regime = get_vix_regime(vix_val)
-    vix_emoji = {"안정": "🟢", "주의": "🟡", "공포": "🔴"}[vix_regime]
-
-    report = f"🚀 **[Seulgi 투자 비서 최종 보고서]**\n📊 VIX 지수: {vix_val:.2f} {vix_emoji}{vix_regime}\n\n"
-    report += "종목 | 추세 | RSI | MA크로스 | 상세 판단\n---|---|---|---|---\n"
-    
-    for t in TICKERS:
-        df = data_cache[t]
-        if df is None or df.empty: 
-            continue
-        last = df.iloc[-1]
-        report += f"{t} | {get_trend_msg(last)} | {last['RSI']:.1f} | {get_cross_msg(df)} | {get_action_msg(last, vix_regime)}\n"
-        # [추가] ATR%, 52주 고점 대비 위치는 부가정보라 들여쓰기로 작게 붙여서 표시
-        report += f"    ㄴ ATR {last['ATR_Pct']:.1f}% · 52주고점대비 {last['Pct_From_52W_High']:.1f}%\n"
-
-    # [추가] 데이터 못 받아온 티커가 있으면 리포트 하단에 명시 (조용히 누락되는 것 방지)
-    if failed_tickers:
-        report += f"\n⚠️ 데이터 조회 실패: {', '.join(failed_tickers)}"
-    
-    # [추가] 이번 주 주요 경제지표(USD/High) — 조회 실패 시 조용히 생략
-    events = get_economic_events()
-    if events:
-        report += "\n\n📅 **이번 주 주요 경제지표 (USD/High)**\n"
-        for e in events:
-            report += f"- {e}\n"
-    
-    # 텔레그램 텍스트 리포트 전송
-    send_telegram("sendMessage", data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
-
-    for t in TICKERS:
-        df = data_cache[t]
-        if df is None or df.empty: 
-            continue
-        
-        # [차트 1] 최근 1개월(30일) 단기 줌인 차트 + 구름대 포함
-        recent_1m = df.iloc[-30:]
-        fig1 = plt.figure(figsize=(10, 6))
-        plt.plot(recent_1m.index, recent_1m['Close'], color='black', label='Price (1M)')
-        plt.plot(recent_1m.index, recent_1m['MA120'], color='blue', linestyle='--', label='MA120')
-        plt.plot(recent_1m.index, recent_1m['EMA9'], color='orange', label='EMA9')
-        plt.fill_between(recent_1m.index, recent_1m['Senkou_Span_A'], recent_1m['Senkou_Span_B'], 
-                         color='lightgreen', alpha=0.3, label='Cloud (Senkou A/B)')
-        plt.title(f"{t} - Recent 1-Month Trend with Cloud")
-        plt.legend()
-        plt.tight_layout()
-        
-        buf1 = io.BytesIO()
-        plt.savefig(buf1, format='png')
-        buf1.seek(0)
-        plt.close(fig1)
-        send_telegram("sendPhoto", data={"chat_id": CHAT_ID}, files={"photo": ("c1.png", buf1)})
-        buf1.close()
-
-        # [차트 2] 기존 3년치 전체 통합 차트
-        fig2 = plt.figure(figsize=(10, 6))
-        plt.plot(df.index, df['Close'], color='black', alpha=0.5, label='Price (3Y)')
-        plt.plot(df.index, df['MA120'], color='blue', label='MA120')
-        plt.plot(df.index, df['MA240'], color='red', label='MA240')
-        plt.title(f"{t} - 3-Year Full Trend")
-        plt.legend()
-        plt.tight_layout()
-        
-        buf2 = io.BytesIO()
-        plt.savefig(buf2, format='png')
-        buf2.seek(0)
-        plt.close(fig2)
-        send_telegram("sendPhoto", data={"chat_id": CHAT_ID}, files={"photo": ("c2.png", buf2)})
-        buf2.close()
-
-        # [차트 3] 180일(약 6개월) 확대 차트 (웅덩이 이격 판정용) + 구름대 포함
-        recent_180d = df.iloc[-180:]
-        fig3 = plt.figure(figsize=(10, 6))
-        plt.plot(recent_180d.index, recent_180d['Close'], color='black', label='Price (180D)')
-        plt.plot(recent_180d.index, recent_180d['MA120'], color='blue', label='MA120')
-        plt.plot(recent_180d.index, recent_180d['MA240'], color='red', label='MA240')
-        plt.fill_between(recent_180d.index, recent_180d['Senkou_Span_A'], recent_180d['Senkou_Span_B'], 
-                         color='lightgreen', alpha=0.3, label='Cloud (Senkou A/B)')
-        plt.title(f"{t} - 180-Day Zoom with Cloud (Entry Point)")
-        plt.legend()
-        plt.tight_layout()
-        
-        buf3 = io.BytesIO()
-        plt.savefig(buf3, format='png')
-        buf3.seek(0)
-        plt.close(fig3)
-        send_telegram("sendPhoto", data={"chat_id": CHAT_ID}, files={"photo": ("c3.png", buf3)})
-        buf3.close()
-
-if __name__ == "__main__":
-    send_report()
+    # 서머타임 해제 기간 (11월 ~ 2월): 한국 시간 밤 11시 30분 (UTC 14:30)
+    - cron: '30 14 8-31 11 *'
+    - cron: '30 14 * 1,2,12 *'
+    - cron: '30 14 1-14 3 *'
+  workflow_dispatch:
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas matplotlib requests pytz
+      - name: Run bot script
+        run: |
+          python Wedding-account.py
