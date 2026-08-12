@@ -48,6 +48,9 @@ def get_data(ticker):
         df["RSI"] = 100 - (100 / (1 + rs))
 
         # 일목균형표 구름대 (Senkou Span A, Senkou Span B) 계산
+        # 여기서는 '계산일 기준' 원본값만 저장한다. 26일 뒤로 미는(shift) 작업은
+        # 차트를 그릴 때(build_cloud_series)만 적용한다 - 원본값을 df에 그대로
+        # 보관해야 최근 26개 값을 '미래 구름'으로 이어붙일 수 있기 때문.
         nine_high = df["High"].rolling(window=9).max()
         nine_low = df["Low"].rolling(window=9).min()
         df["Conversion_Line"] = (nine_high + nine_low) / 2
@@ -132,6 +135,33 @@ def build_report_text(data_cache, vix_val, failed_tickers):
     return "\n".join(lines).strip()
 
 
+def build_cloud_series(df, window_df, periods=26):
+    """
+    일목균형표 구름대(선행스팬)는 계산일 기준 26기간 '뒤(미래)'에 표시하는 것이 정석.
+    -> 과거 구간(window_df 범위)은 26기간 뒤로 shift해서 정렬하고,
+       가장 최근 26개 계산값은 아직 실제 가격 데이터가 없는 '미래' 영업일에
+       이어붙여서 구름이 캔들(가격)보다 오른쪽으로 튀어나오도록 만든다.
+
+    반환되는 두 시리즈(cloud_a, cloud_b)는 과거 구간 + 미래 26영업일이
+    합쳐진 인덱스를 가지므로, 그대로 ax.fill_between(index, a, b)에 사용하면 된다.
+    """
+    shifted_a = df["Senkou_Span_A"].shift(periods)
+    shifted_b = df["Senkou_Span_B"].shift(periods)
+
+    hist_a = shifted_a.loc[window_df.index]
+    hist_b = shifted_b.loc[window_df.index]
+
+    future_dates = pd.bdate_range(
+        start=df.index[-1] + pd.Timedelta(days=1), periods=periods, freq="B"
+    )
+    future_a = pd.Series(df["Senkou_Span_A"].tail(periods).values, index=future_dates)
+    future_b = pd.Series(df["Senkou_Span_B"].tail(periods).values, index=future_dates)
+
+    cloud_a = pd.concat([hist_a, future_a])
+    cloud_b = pd.concat([hist_b, future_b])
+    return cloud_a, cloud_b
+
+
 def build_ticker_chart(ticker, df):
     """
     기존에는 티커 1개당 차트 3장을 따로 만들어 각각 전송(5종목 x 3장 = 15장)했기 때문에
@@ -140,26 +170,30 @@ def build_ticker_chart(ticker, df):
     """
     fig, axes = plt.subplots(3, 1, figsize=(10, 15))
 
-    # 1) 최근 1개월 단기 줌인 + 구름대
+    # 1) 최근 1개월 단기 줌인 + 구름대(26일 미래까지 확장)
     recent_1m = df.iloc[-30:]
     ax = axes[0]
+    cloud_a, cloud_b = build_cloud_series(df, recent_1m)
     ax.plot(recent_1m.index, recent_1m['Close'], color='black', label='Price (1M)')
     ax.plot(recent_1m.index, recent_1m['MA120'], color='blue', linestyle='--', label='MA120')
     ax.plot(recent_1m.index, recent_1m['EMA9'], color='orange', label='EMA9')
-    ax.fill_between(recent_1m.index, recent_1m['Senkou_Span_A'], recent_1m['Senkou_Span_B'],
-                     color='lightgreen', alpha=0.3, label='Cloud')
-    ax.set_title(f"{ticker} - Recent 1-Month")
+    ax.fill_between(cloud_a.index, cloud_a, cloud_b,
+                     color='lightgreen', alpha=0.3, label='Cloud (+26D)')
+    ax.axvline(df.index[-1], color='gray', linestyle=':', linewidth=1)
+    ax.set_title(f"{ticker} - Recent 1-Month (+26D Cloud)")
     ax.legend(fontsize=8)
 
-    # 2) 180일(약 6개월) 확대 + 구름대 (웅덩이/이격도 판정용)
+    # 2) 180일(약 6개월) 확대 + 구름대(26일 미래까지 확장) (웅덩이/이격도 판정용)
     recent_180d = df.iloc[-180:]
     ax = axes[1]
+    cloud_a, cloud_b = build_cloud_series(df, recent_180d)
     ax.plot(recent_180d.index, recent_180d['Close'], color='black', label='Price (180D)')
     ax.plot(recent_180d.index, recent_180d['MA120'], color='blue', label='MA120')
     ax.plot(recent_180d.index, recent_180d['MA240'], color='red', label='MA240')
-    ax.fill_between(recent_180d.index, recent_180d['Senkou_Span_A'], recent_180d['Senkou_Span_B'],
-                     color='lightgreen', alpha=0.3, label='Cloud')
-    ax.set_title(f"{ticker} - 180-Day Zoom (Entry Point)")
+    ax.fill_between(cloud_a.index, cloud_a, cloud_b,
+                     color='lightgreen', alpha=0.3, label='Cloud (+26D)')
+    ax.axvline(df.index[-1], color='gray', linestyle=':', linewidth=1)
+    ax.set_title(f"{ticker} - 180-Day Zoom (+26D Cloud, Entry Point)")
     ax.legend(fontsize=8)
 
     # 3) 3년치 전체 통합 차트
